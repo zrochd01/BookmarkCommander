@@ -47,6 +47,7 @@ const appVersion = __APP_VERSION__
 
 const publishedData = document.getElementById('rochecommander-data')
 const published = publishedData !== null
+const editorHandoffToken = published ? null : new URLSearchParams(window.location.hash.slice(1)).get('rochecommander-import')
 const data = ref<Data>({ bookmarks: [], categories: [], quickLinks: [], theme: 'system', sort: 'name', fontFamily: 'default', fontSize: defaultFontSize })
 const error = ref('')
 const dirty = ref(false)
@@ -84,6 +85,8 @@ let dragDepth = 0
 let media: MediaQueryList
 let highlightTimeout: number | undefined
 let clockInterval: number | undefined
+let pendingEditorWindow: Window | null = null
+let pendingEditorToken: string | null = null
 
 const selectedBackgroundColor = computed(() => data.value.backgroundColor ?? (effectiveDark.value ? defaultDarkBackgroundColor : defaultBackgroundColor))
 const currentDateTimeLabel = computed(() => {
@@ -178,9 +181,59 @@ function assignUncategorizedBookmarks(value: Data): { data: Data; migrated: bool
   }
 }
 
+function loadData(parsed: unknown) {
+  if (!isData(parsed)) throw new Error('This file is not a valid Bookmark Commander bookmarks file.')
+  const normalized = assignUncategorizedBookmarks({ ...parsed, sort: 'name' })
+  data.value = normalized.data
+  dirty.value = normalized.migrated
+  exportRequested.value = false
+  publishRequested.value = false
+  selection.value = 'all'
+  error.value = ''
+  applyTheme()
+}
+
 function openBookmarksFile() {
   settingsOpen.value = false
   importInput.value?.click()
+}
+
+function openEditor(event: MouseEvent) {
+  event.preventDefault()
+  if (!publishedData) return
+  const token = crypto.randomUUID()
+  const editorUrl = new URL('./BookMarkCommander_Editor.html', window.location.href)
+  editorUrl.hash = `rochecommander-import=${encodeURIComponent(token)}`
+  pendingEditorToken = token
+  pendingEditorWindow = window.open(editorUrl.href, '_blank')
+  if (!pendingEditorWindow) {
+    pendingEditorToken = null
+    error.value = 'Allow pop-ups to open the editor with these bookmarks.'
+  }
+}
+
+function receiveEditorReady(event: MessageEvent) {
+  if (!pendingEditorWindow || event.source !== pendingEditorWindow || !isRecord(event.data) ||
+    event.data.type !== 'rochecommander-editor-ready' || event.data.token !== pendingEditorToken) return
+  pendingEditorWindow.postMessage({
+    type: 'rochecommander-import',
+    token: pendingEditorToken,
+    contents: publishedData?.textContent ?? '',
+  }, '*')
+  pendingEditorWindow = null
+  pendingEditorToken = null
+}
+
+function receivePublishedBookmarks(event: MessageEvent) {
+  if (!editorHandoffToken || event.source !== window.opener || !isRecord(event.data) ||
+    event.data.type !== 'rochecommander-import' || event.data.token !== editorHandoffToken ||
+    typeof event.data.contents !== 'string') return
+  window.removeEventListener('message', receivePublishedBookmarks)
+  try {
+    loadData(JSON.parse(event.data.contents))
+  } catch (err) {
+    error.value = err instanceof Error ? `Could not load published bookmarks: ${err.message}` : 'Could not load published bookmarks.'
+  }
 }
 
 async function importData(event: Event) {
@@ -189,16 +242,8 @@ async function importData(event: Event) {
   if (!file) return
   try {
     const parsed: unknown = JSON.parse(await file.text())
-    if (!isData(parsed)) throw new Error('This file is not a valid BookMark Commander bookmarks file.')
     if (dirty.value && !confirm('Opening a file will replace your unsaved changes. Continue?')) return
-    const normalized = assignUncategorizedBookmarks({ ...parsed, sort: 'name' })
-    data.value = normalized.data
-    dirty.value = normalized.migrated
-    exportRequested.value = false
-    publishRequested.value = false
-    selection.value = 'all'
-    error.value = ''
-    applyTheme()
+    loadData(parsed)
   } catch (err) {
     error.value = err instanceof Error ? `Could not open bookmarks: ${err.message}` : 'Could not open the bookmarks file.'
   } finally {
@@ -219,7 +264,7 @@ function download(contents: string, type: string, filename: string) {
   setTimeout(() => URL.revokeObjectURL(url), 60_000)
 }
 
-async function saveBookmarksFile() {
+async function saveBookmarksFile(): Promise<'saved' | 'downloaded' | 'cancelled' | 'failed'> {
   settingsOpen.value = false
   try {
     const contents = JSON.stringify(data.value, null, 2)
@@ -234,22 +279,34 @@ async function saveBookmarksFile() {
       await writable.close()
       dirty.value = false
       exportRequested.value = false
+      error.value = ''
+      return 'saved'
     } else {
       download(contents, 'application/json', 'bookmarks.json')
       exportRequested.value = true
+      error.value = ''
+      return 'downloaded'
     }
-    error.value = ''
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') return
+    if (err instanceof DOMException && err.name === 'AbortError') return 'cancelled'
     error.value = err instanceof Error ? `Could not save bookmarks: ${err.message}` : 'Could not save the bookmarks file.'
+    return 'failed'
   }
 }
 
 async function publish() {
+  if (!document.querySelector('meta[name="rochecommander-standalone"]')) {
+    error.value = 'Open BookMarkCommander_Editor.html to publish a self-contained page.'
+    return
+  }
+  const saveResult = await saveBookmarksFile()
+  if (saveResult === 'cancelled' || saveResult === 'failed') return
+  if (saveResult === 'downloaded') {
+    if (!confirm('A JSON download was started. Confirm that it was saved before publishing. Continue?')) return
+    dirty.value = false
+    exportRequested.value = false
+  }
   try {
-    if (!document.querySelector('meta[name="rochecommander-standalone"]')) {
-      throw new Error('Open BookMarkCommander_Editor.html to publish a self-contained page.')
-    }
     const root = document.documentElement.cloneNode(true)
     if (!(root instanceof HTMLElement)) throw new Error('Could not prepare the published page.')
     const app = root.querySelector('#app')
@@ -264,7 +321,7 @@ async function publish() {
     embedded.textContent = JSON.stringify(data.value).replace(/</g, '\\u003c')
     head.appendChild(embedded)
     const title = head.querySelector('title')
-    if (title) title.textContent = 'BookMark Commander'
+    if (title) title.textContent = 'Bookmark Commander'
     const contents = `<!DOCTYPE html>\n${root.outerHTML}`
     const savePicker = (window as SaveFilePickerWindow).showSaveFilePicker
     if (savePicker) {
@@ -702,6 +759,10 @@ onMounted(() => {
     } catch (err) {
       error.value = err instanceof Error ? `Could not load published bookmarks: ${err.message}` : 'Could not load published bookmarks.'
     }
+    window.addEventListener('message', receiveEditorReady)
+  } else if (editorHandoffToken && window.opener) {
+    window.addEventListener('message', receivePublishedBookmarks)
+    window.opener.postMessage({ type: 'rochecommander-editor-ready', token: editorHandoffToken }, '*')
   }
   media.addEventListener('change', applyTheme)
   if (!published) {
@@ -724,6 +785,8 @@ onUnmounted(() => {
   document.removeEventListener('click', closeMenusOnOutsideClick)
   window.removeEventListener('keydown', closeOnEscape)
   window.removeEventListener('beforeunload', beforeUnload)
+  window.removeEventListener('message', receiveEditorReady)
+  window.removeEventListener('message', receivePublishedBookmarks)
   if (highlightTimeout !== undefined) window.clearTimeout(highlightTimeout)
   if (clockInterval !== undefined) window.clearInterval(clockInterval)
 })
@@ -732,7 +795,7 @@ onUnmounted(() => {
 <template>
   <div class="app-shell" :class="{ dragging, published }" :style="appearanceStyle" @click="sidebarContextMenu = null">
     <aside class="sidebar" @click="handleSidebarClick" @contextmenu="showSidebarContextMenu($event)">
-      <div class="brand"><svg class="rudder" viewBox="0 0 36 36" aria-hidden="true"><circle cx="18" cy="18" r="11.5" /><circle cx="18" cy="18" r="3" /><path d="M18 15V3M18 21v12M15 18H3M21 18h12M15.9 15.9 7.4 7.4M20.1 20.1l8.5 8.5M20.1 15.9l8.5-8.5M15.9 20.1l-8.5 8.5" /><circle cx="18" cy="2.5" r="1.5" /><circle cx="18" cy="33.5" r="1.5" /><circle cx="2.5" cy="18" r="1.5" /><circle cx="33.5" cy="18" r="1.5" /><circle cx="6.8" cy="6.8" r="1.5" /><circle cx="29.2" cy="29.2" r="1.5" /><circle cx="29.2" cy="6.8" r="1.5" /><circle cx="6.8" cy="29.2" r="1.5" /></svg><span>BookMark Commander</span></div>
+      <div class="brand"><svg class="rudder" viewBox="0 0 36 36" aria-hidden="true"><circle cx="18" cy="18" r="11.5" /><circle cx="18" cy="18" r="3" /><path d="M18 15V3M18 21v12M15 18H3M21 18h12M15.9 15.9 7.4 7.4M20.1 20.1l8.5 8.5M20.1 15.9l8.5-8.5M15.9 20.1l-8.5 8.5" /><circle cx="18" cy="2.5" r="1.5" /><circle cx="18" cy="33.5" r="1.5" /><circle cx="2.5" cy="18" r="1.5" /><circle cx="33.5" cy="18" r="1.5" /><circle cx="6.8" cy="6.8" r="1.5" /><circle cx="29.2" cy="29.2" r="1.5" /><circle cx="29.2" cy="6.8" r="1.5" /><circle cx="6.8" cy="29.2" r="1.5" /></svg><span>Bookmark Commander</span></div>
       <nav aria-label="Bookmark categories">
         <div class="sidebar-heading">
           <span>Categories</span>
@@ -761,12 +824,12 @@ onUnmounted(() => {
     <main @contextmenu="showSidebarContextMenu($event)">
       <header class="topbar">
         <div>
-          <h1>{{ published ? 'BookMark Commander' : 'BookMark Commander Editor' }}</h1>
+          <h1>{{ published ? 'Bookmark Commander' : 'Bookmark Commander Editor' }}</h1>
         </div>
         <div class="toolbar-stack">
           <time v-if="published" class="published-clock" :datetime="currentDateTime.toISOString()">{{ currentDateTimeLabel }}</time>
           <div class="toolbar">
-            <a v-if="published" class="settings-button" href="./BookMarkCommander_Editor.html" target="_blank" rel="noopener noreferrer">Bookmark Editor</a>
+            <a v-if="published" class="settings-button" href="./BookMarkCommander_Editor.html" target="_blank" rel="noopener noreferrer" @click="openEditor">Bookmark Editor</a>
             <button v-if="!published" class="primary-button publish-button" @click="publish">Publish</button>
             <a v-if="!published" class="settings-button" href="./BookMarkCommander.html" target="_blank" rel="noopener noreferrer">Open Published Page</a>
             <label class="search-control"><span aria-hidden="true">⌕</span><input v-model="search" type="search" placeholder="Search your bookmarks..." aria-label="Search bookmarks" /></label>
@@ -885,17 +948,17 @@ onUnmounted(() => {
           <button ref="infoCloseButton" class="small-action" aria-label="Close" @click="closeInfoDialog">×</button>
         </div>
         <div v-if="infoDialog === 'help'" class="info-content">
-          <p>Use BookMark Commander Editor to manage your bookmarks and create a read-only page.</p>
+          <p>Use Bookmark Commander Editor to manage your bookmarks and create a read-only page.</p>
           <h3>Load a JSON file</h3>
-          <p>Open BookMarkCommander_Editor.html, then choose <strong>Settings → Open Bookmarks file</strong> and select your saved bookmarks JSON. Opening a file replaces the current collection; you will be warned if you have unsaved changes. You can also start with an empty collection.</p>
+          <p>On a published page, choose <strong>Bookmark Editor</strong> to open the editor with that page's bookmarks. Otherwise, open BookMarkCommander_Editor.html, then choose <strong>Settings → Open Bookmarks file</strong> and select your saved bookmarks JSON. Opening a file replaces the current collection; you will be warned if you have unsaved changes. You can also start with an empty collection.</p>
           <h3>Save a JSON file</h3>
           <p>Choose <strong>Settings → Save Bookmarks file</strong> after editing. Choose a location if prompted, or check your browser's downloads for bookmarks.json. Keep this file to make future edits. If prompted in the editor, confirm that the download was saved.</p>
           <h3>Publish the page</h3>
-          <p>In the standalone editor, select <strong>Publish</strong> and choose a location if prompted, or check your browser's downloads for BookMarkCommander.html. Open that file in a browser to view and search your bookmarks. It is read-only; use the editor and your JSON file to make changes, then publish again.</p>
-          <p>Publishing does not save your JSON file. Save it separately whenever you make changes.</p>
+          <p>In the standalone editor, select <strong>Publish</strong>. Save the bookmarks JSON first; if it downloads instead, confirm that it was saved before publishing continues. Then choose a location if prompted, or check your browser's downloads for BookMarkCommander.html. Open that file in a browser to view and search your bookmarks. It is read-only; use the editor and your JSON file to make changes, then publish again.</p>
+          <p>Publishing creates separate JSON and HTML files. Keep the JSON file for future edits.</p>
         </div>
         <div v-else class="info-content">
-          <p>BookMark Commander</p>
+          <p>Bookmark Commander</p>
           <p>Version: {{ appVersion }} (build timestamp)</p>
         </div>
       </div>
